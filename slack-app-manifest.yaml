@@ -1,8 +1,8 @@
 display_information:
   name: Claude Code Bot
-  description: AI-powered coding assistant using Claude Code SDK
+  description: AI-powered coding assistant using Claude Agent SDK
   background_color: "#4A154B"
-  long_description: This bot integrates Claude Code SDK with Slack to provide AI-powered coding assistance directly in your workspace. It supports streaming responses, maintains conversation context, and can help with code reviews, debugging, and general programming questions.
+  long_description: A configurable Slack bot powered by Claude Agent SDK. Supports streaming responses, session management, MCP tool integration, file uploads, interactive permission prompts, and customizable system prompts and shortcut commands.
 features:
   app_home:
     home_tab_enabled: false

@@ -9,6 +9,7 @@ import { McpManager } from './mcp-manager';
 import { writeApprovalResult, cleanupStaleApprovals } from './permission-bridge';
 import { config } from './config';
 import { RateLimiter } from './rate-limiter';
+import { loadBotConfig, formatWelcomeMessage } from './bot-config';
 
 interface MessageEvent {
   user: string;
@@ -58,120 +59,125 @@ export class SlackHandler {
     const { user, channel, thread_ts, ts, files } = event;
     let text = event.text;
     const isDM = channel.startsWith('D');
-    
-    // In DMs: don't use threads, reply directly in the conversation
-    // In channels: use threads as before
     const replyThreadTs = isDM ? undefined : (thread_ts || ts);
-    // For session key: DMs use stable key (no thread_ts), channels use thread_ts
     const sessionThreadTs = isDM ? undefined : (thread_ts || ts);
-    
-    // Rate limit check (before any expensive work)
+    const replyOpts = replyThreadTs ? { thread_ts: replyThreadTs } : {};
+
+    // Phase 1: Rate limiting
     if (!this.rateLimiter.isAllowed(user)) {
-      await say({
-        text: `⚠️ 请求过于频繁，请稍后再试。(限制: ${process.env.RATE_LIMIT_PER_MINUTE || '10'} 次/分钟)`,
-        ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}),
-      });
+      await say({ text: `⚠️ Rate limit exceeded. (${process.env.RATE_LIMIT_PER_MINUTE || '10'}/min)`, ...replyOpts });
       return;
     }
-
-    // If no text and no files, nothing to process
     if (!text && (!files || files.length === 0)) return;
 
-    this.logger.debug('Received message from Slack', {
-      user,
-      channel,
-      thread_ts,
-      ts,
-      text: text ? text.substring(0, 100) + (text.length > 100 ? '...' : '') : '[no text]',
-      fileCount: files?.length || 0,
-    });
+    this.logger.debug('Received message', { user, channel, text: text?.substring(0, 100), fileCount: files?.length || 0 });
 
-    // If ADMIN_USERS is not configured, only the bot's first DM user gets admin.
-    // Otherwise, check the explicit whitelist.
-    const isAdmin = config.adminUsers.length > 0
-      ? config.adminUsers.includes(user)
-      : false; // No ADMIN_USERS = no admin commands for anyone
+    // Phase 2: Command parsing (returns early if handled)
+    const commandResult = await this.handleCommand(text, user, channel, isDM, thread_ts, sessionThreadTs, replyOpts, say);
+    if (commandResult.handled) {
+      text = commandResult.expandedText || text;
+      if (commandResult.returned) return;
+    }
 
-    // Handle !model — show or switch model
-    if (text && /^[!/]model(\s+\S+)?$/.test(text.trim())) {
+    // Phase 3: Context validation
+    const workingDirectory = this.workingDirManager.getWorkingDirectory(channel, thread_ts, isDM ? user : undefined);
+    if (!workingDirectory) {
+      await say({ text: this.buildMissingDirMessage(isDM, channel, thread_ts), ...replyOpts });
+      return;
+    }
+
+    // Phase 4: File processing (after commands to avoid temp file leaks)
+    let processedFiles: ProcessedFile[] = [];
+    if (files && files.length > 0) {
+      this.logger.info('Processing uploaded files', { count: files.length });
+      processedFiles = await this.fileHandler.downloadAndProcessFiles(files);
+      if (processedFiles.length > 0) {
+        await say({ text: `📎 Processing ${processedFiles.length} file(s): ${processedFiles.map(f => f.name).join(', ')}`, ...replyOpts });
+      }
+    }
+
+    // Phase 5: Execute Claude query
+    await this.executeClaudeQuery(text, user, channel, thread_ts, ts, isDM, sessionThreadTs, replyThreadTs, replyOpts, processedFiles, workingDirectory, say);
+  }
+
+  /**
+   * Phase 2: Parse and handle local commands. Returns { handled, returned, expandedText }.
+   * - handled=true, returned=true: command fully handled, caller should return
+   * - handled=true, returned=false: shortcut expanded, caller should continue with expandedText
+   * - handled=false: not a command, pass through
+   */
+  private async handleCommand(
+    text: string | undefined, user: string, channel: string, isDM: boolean,
+    thread_ts: string | undefined, sessionThreadTs: string | undefined,
+    replyOpts: any, say: any,
+  ): Promise<{ handled: boolean; returned: boolean; expandedText?: string }> {
+    if (!text) return { handled: false, returned: false };
+
+    const isAdmin = config.adminUsers.length > 0 ? config.adminUsers.includes(user) : false;
+
+    // !model
+    if (/^[!/]model(\s+\S+)?$/.test(text.trim())) {
       const parts = text.trim().split(/\s+/);
       if (parts.length === 1) {
-        // Show current model (allowed for everyone)
         const current = this.claudeHandler.getModel();
-        await say({
-          text: `🤖 *当前模型:* \`${current || '(SDK 默认)'}\`\n\n可用命令:\n\`!model claude-opus-4-6\` — Opus 4.6（最强）\n\`!model claude-sonnet-4-6\` — Sonnet 4.6（平衡）\n\`!model claude-haiku-4-5-20251001\` — Haiku 4.5（快速）\n\`!model default\` — 恢复 SDK 默认`,
-          ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}),
-        });
+        await say({ text: `🤖 *Current model:* \`${current || '(SDK default)'}\`\n\n\`!model <name>\` to switch, \`!model default\` to reset`, ...replyOpts });
       } else {
-        if (!isAdmin) {
-          await say({ text: '⛔ 仅管理员可以切换模型。', ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}) });
-          return;
-        }
-        const newModel = parts[1];
-        if (newModel === 'default') {
-          this.claudeHandler.setModel(undefined);
-          await say({
-            text: `✅ 已恢复为 SDK 默认模型`,
-            ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}),
-          });
-        } else {
-          this.claudeHandler.setModel(newModel);
-          await say({
-            text: `✅ 模型已切换为: \`${newModel}\``,
-            ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}),
-          });
-        }
+        if (!isAdmin) { await say({ text: '⛔ Admin only.', ...replyOpts }); return { handled: true, returned: true }; }
+        const m = parts[1];
+        this.claudeHandler.setModel(m === 'default' ? undefined : m);
+        await say({ text: m === 'default' ? `✅ Model reset to SDK default` : `✅ Model: \`${m}\``, ...replyOpts });
       }
-      return;
+      return { handled: true, returned: true };
     }
 
-    // Handle /new and !new — reset session
-    const trimmedText = text ? text.trim().toLowerCase() : '';
-    if (trimmedText === '/new' || trimmedText === '!new') {
-      // Clear the existing session for this DM/channel
-      const oldSessionKey = this.claudeHandler.getSessionKey(user, channel, sessionThreadTs);
-      this.logger.audit('session.reset', { user, channel, sessionKey: oldSessionKey });
+    const trimmed = text.trim().toLowerCase();
+
+    // !new
+    if (trimmed === '/new' || trimmed === '!new') {
+      const key = this.claudeHandler.getSessionKey(user, channel, sessionThreadTs);
+      this.logger.audit('session.reset', { user, channel, sessionKey: key });
       this.claudeHandler.deleteSession(user, channel, sessionThreadTs);
-      await say({
-        text: `🔄 *会话已重置。* 新的 Claude Code 会话已准备就绪。`,
-        ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}),
-      });
-      return;
+      await say({ text: `🔄 *Session reset.* Ready for new conversation.`, ...replyOpts });
+      return { handled: true, returned: true };
     }
 
-    // Handle /quit and !quit — kill the current tmux session (admin only)
-    if (trimmedText === '/quit' || trimmedText === '!quit') {
-      if (!isAdmin) {
-        await say({ text: '⛔ 仅管理员可以关闭 Bot。', ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}) });
-        return;
-      }
+    // !quit (admin only)
+    if (trimmed === '/quit' || trimmed === '!quit') {
+      if (!isAdmin) { await say({ text: '⛔ Admin only.', ...replyOpts }); return { handled: true, returned: true }; }
       this.logger.audit('command.quit', { user, channel });
-      await say({
-        text: `👋 *正在关闭 tmux 会话，Bot 即将停止运行。*`,
-        ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}),
-      });
-      const { execSync } = require('child_process');
-      try {
-        execSync('tmux kill-session', { stdio: 'ignore' });
-      } catch (_) {
-        // Not in a tmux session or already dead
-        process.exit(0);
-      }
-      return;
+      await say({ text: `👋 *Shutting down...*`, ...replyOpts });
+      try { require('child_process').execSync('tmux kill-session', { stdio: 'ignore' }); } catch { process.exit(0); }
+      return { handled: true, returned: true };
     }
 
-    // Handle shortcut commands (prefix with ! or /)
-    if (text && (text.startsWith('!') || text.startsWith('/'))) {
+    // !context
+    if (trimmed === '!context' || trimmed === '/context') {
+      const session = this.claudeHandler.getSession(user, channel, sessionThreadTs);
+      const dir = this.workingDirManager.getWorkingDirectory(channel, thread_ts, isDM ? user : undefined);
+      const model = this.claudeHandler.getModel();
+      await say({
+        text: `📋 *Current context:*\n` +
+          `• Working directory: \`${dir || '(not set)'}\`\n` +
+          `• Model: \`${model || '(SDK default)'}\`\n` +
+          `• Session: ${session?.sessionId ? `active (\`${session.sessionId.substring(0, 8)}...\`)` : 'none'}\n` +
+          `• Admin: ${isAdmin ? 'yes' : 'no'}`,
+        ...replyOpts,
+      });
+      return { handled: true, returned: true };
+    }
+
+    // !reset-dir
+    if (trimmed === '!reset-dir' || trimmed === '/reset-dir') {
+      this.workingDirManager.removeWorkingDirectory(channel, thread_ts, isDM ? user : undefined);
+      await say({ text: `✅ Working directory binding cleared.`, ...replyOpts });
+      return { handled: true, returned: true };
+    }
+
+    // Shortcuts (! or / prefix)
+    if (text.startsWith('!') || text.startsWith('/')) {
       const shortcut = text.slice(1).trim().toLowerCase();
-      const shortcuts: Record<string, string> = {
-        'status': 'Run: openclaw status && openclaw gateway status',
-        'restart': 'Run: openclaw gateway stop 2>/dev/null; sleep 1; openclaw gateway install && sleep 3 && openclaw gateway status',
-        'logs': 'Run: tail -80 ~/.openclaw/logs/gateway.log',
-        'config': 'Read the file ~/.openclaw/openclaw.json and show a brief summary of the current configuration',
-        'fix': 'Diagnose the current OpenClaw issue: check gateway status, recent logs, and config validity. Then suggest or apply fixes.',
-        'ps': 'Run: ps aux | grep -E "openclaw|gateway|node" | grep -v grep',
-        'help': '',
-      };
+      const botCfg = loadBotConfig();
+      const shortcuts: Record<string, string> = { ...botCfg.shortcuts, 'help': '' };
 
       if (shortcut === 'help') {
         const helpText = Object.entries(shortcuts)
@@ -179,150 +185,80 @@ export class SlackHandler {
           .map(([k, v]) => `\`!${k}\` — ${v.substring(0, 60)}`)
           .join('\n');
         await say({
-          text: `📋 *快捷命令:*\n${helpText}\n\`!model\` — 查看/切换模型\n\`!new\` — 重置会话\n\`!quit\` — 关闭 tmux 会话（停止 Bot）\n\`!help\` — 显示帮助`,
-          ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}),
+          text: `📋 *Commands:*\n${helpText}\n\`!model\` — Show/switch model\n\`!context\` — Show current context\n\`!new\` — Reset session\n\`!reset-dir\` — Clear directory binding\n\`!quit\` — Shutdown (admin)\n\`!help\` — This help`,
+          ...replyOpts,
         });
-        return;
+        return { handled: true, returned: true };
       }
 
       if (shortcuts[shortcut]) {
         this.logger.audit('command.executed', { user, channel, command: shortcut });
-        // Replace text with the expanded command and continue to Claude
-        text = shortcuts[shortcut];
+        return { handled: true, returned: false, expandedText: shortcuts[shortcut] };
       }
-      // If not a known shortcut, pass through to Claude as-is
     }
 
-    // Check if this is a working directory command (only if there's text)
-    const setDirPath = text ? this.workingDirManager.parseSetCommand(text) : null;
+    // cwd set
+    const setDirPath = this.workingDirManager.parseSetCommand(text);
     if (setDirPath) {
-      const result = this.workingDirManager.setWorkingDirectory(
-        channel,
-        setDirPath,
-        thread_ts,
-        isDM ? user : undefined
-      );
-
-      if (result.success) {
-        const context = thread_ts ? 'this thread' : (isDM ? 'this conversation' : 'this channel');
-        await say({
-          text: `✅ Working directory set for ${context}: \`${result.resolvedPath}\``,
-          ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}),
-        });
-      } else {
-        await say({
-          text: `❌ ${result.error}`,
-          ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}),
-        });
-      }
-      return;
+      const result = this.workingDirManager.setWorkingDirectory(channel, setDirPath, thread_ts, isDM ? user : undefined);
+      const ctx = thread_ts ? 'this thread' : (isDM ? 'this conversation' : 'this channel');
+      await say({ text: result.success ? `✅ Working directory set for ${ctx}: \`${result.resolvedPath}\`` : `❌ ${result.error}`, ...replyOpts });
+      return { handled: true, returned: true };
     }
 
-    // Check if this is a get directory command (only if there's text)
-    if (text && this.workingDirManager.isGetCommand(text)) {
-      const directory = this.workingDirManager.getWorkingDirectory(
-        channel,
-        thread_ts,
-        isDM ? user : undefined
-      );
-      const context = thread_ts ? 'this thread' : (isDM ? 'this conversation' : 'this channel');
-      
-      await say({
-        text: this.workingDirManager.formatDirectoryMessage(directory, context),
-        ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}),
-      });
-      return;
+    // cwd get
+    if (this.workingDirManager.isGetCommand(text)) {
+      const dir = this.workingDirManager.getWorkingDirectory(channel, thread_ts, isDM ? user : undefined);
+      const ctx = thread_ts ? 'this thread' : (isDM ? 'this conversation' : 'this channel');
+      await say({ text: this.workingDirManager.formatDirectoryMessage(dir, ctx), ...replyOpts });
+      return { handled: true, returned: true };
     }
 
-    // Check if this is an MCP info command (only if there's text)
-    if (text && this.isMcpInfoCommand(text)) {
-      await say({
-        text: this.mcpManager.formatMcpInfo(),
-        ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}),
-      });
-      return;
+    // MCP info/reload
+    if (this.isMcpInfoCommand(text)) {
+      await say({ text: this.mcpManager.formatMcpInfo(), ...replyOpts });
+      return { handled: true, returned: true };
+    }
+    if (this.isMcpReloadCommand(text)) {
+      const ok = this.mcpManager.reloadConfiguration();
+      await say({ text: ok ? `✅ MCP reloaded.\n\n${this.mcpManager.formatMcpInfo()}` : `❌ MCP reload failed.`, ...replyOpts });
+      return { handled: true, returned: true };
     }
 
-    // Check if this is an MCP reload command (only if there's text)
-    if (text && this.isMcpReloadCommand(text)) {
-      const reloaded = this.mcpManager.reloadConfiguration();
-      if (reloaded) {
-        await say({
-          text: `✅ MCP configuration reloaded successfully.\n\n${this.mcpManager.formatMcpInfo()}`,
-          ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}),
-        });
-      } else {
-        await say({
-          text: `❌ Failed to reload MCP configuration. Check the mcp-servers.json file.`,
-          ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}),
-        });
-      }
-      return;
+    return { handled: false, returned: false };
+  }
+
+  private buildMissingDirMessage(isDM: boolean, channel: string, thread_ts?: string): string {
+    let msg = `⚠️ No working directory set. `;
+    if (!isDM && !this.workingDirManager.hasChannelWorkingDirectory(channel)) {
+      msg += `Set one with:\n`;
+      msg += config.baseDirectory ? `\`cwd project-name\` or \`cwd /absolute/path\`\n\nBase: \`${config.baseDirectory}\`` : `\`cwd /path/to/directory\``;
+    } else if (thread_ts) {
+      msg += `Set a thread-specific directory:\n`;
+      msg += config.baseDirectory ? `\`cwd project-name\` or \`cwd /absolute/path\`` : `\`cwd /path/to/directory\``;
+    } else {
+      msg += `Set one with:\n\`cwd /path/to/directory\``;
     }
+    return msg;
+  }
 
-    // Check if we have a working directory set
-    const workingDirectory = this.workingDirManager.getWorkingDirectory(
-      channel,
-      thread_ts,
-      isDM ? user : undefined
-    );
-
-    // Working directory is always required
-    if (!workingDirectory) {
-      let errorMessage = `⚠️ No working directory set. `;
-      
-      if (!isDM && !this.workingDirManager.hasChannelWorkingDirectory(channel)) {
-        // No channel default set
-        errorMessage += `Please set a default working directory for this channel first using:\n`;
-        if (config.baseDirectory) {
-          errorMessage += `\`cwd project-name\` or \`cwd /absolute/path\`\n\n`;
-          errorMessage += `Base directory: \`${config.baseDirectory}\``;
-        } else {
-          errorMessage += `\`cwd /path/to/directory\``;
-        }
-      } else if (thread_ts) {
-        // In thread but no thread-specific directory
-        errorMessage += `You can set a thread-specific working directory using:\n`;
-        if (config.baseDirectory) {
-          errorMessage += `\`@claudebot cwd project-name\` or \`@claudebot cwd /absolute/path\``;
-        } else {
-          errorMessage += `\`@claudebot cwd /path/to/directory\``;
-        }
-      } else {
-        errorMessage += `Please set one first using:\n\`cwd /path/to/directory\``;
-      }
-      
-      await say({
-        text: errorMessage,
-        ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}),
-      });
-      return;
-    }
-
-    // Process any attached files (after command checks to avoid temp file leaks)
-    let processedFiles: ProcessedFile[] = [];
-    if (files && files.length > 0) {
-      this.logger.info('Processing uploaded files', { count: files.length });
-      processedFiles = await this.fileHandler.downloadAndProcessFiles(files);
-
-      if (processedFiles.length > 0) {
-        await say({
-          text: `📎 Processing ${processedFiles.length} file(s): ${processedFiles.map(f => f.name).join(', ')}`,
-          ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}),
-        });
-      }
-    }
-
+  /**
+   * Phase 5: Execute Claude query with streaming, tool handling, and cleanup.
+   */
+  private async executeClaudeQuery(
+    text: string | undefined, user: string, channel: string,
+    thread_ts: string | undefined, ts: string, isDM: boolean,
+    sessionThreadTs: string | undefined, replyThreadTs: string | undefined,
+    replyOpts: any, processedFiles: ProcessedFile[],
+    workingDirectory: string, say: any,
+  ) {
     const sessionKey = this.claudeHandler.getSessionKey(user, channel, sessionThreadTs);
+    this.originalMessages.set(sessionKey, { channel, ts: replyThreadTs || ts });
 
-    // Store the original message info for status reactions
-    const originalMessageTs = replyThreadTs || ts;
-    this.originalMessages.set(sessionKey, { channel, ts: originalMessageTs });
-    
-    // Cancel any existing request for this conversation
+    // Cancel any existing request
     const existingController = this.activeControllers.get(sessionKey);
     if (existingController) {
-      this.logger.debug('Cancelling existing request for session', { sessionKey });
+      this.logger.debug('Cancelling existing request', { sessionKey });
       existingController.abort();
     }
 
@@ -332,209 +268,110 @@ export class SlackHandler {
     let session = this.claudeHandler.getSession(user, channel, sessionThreadTs);
     let isNewSession = false;
     if (!session) {
-      this.logger.debug('Creating new session', { sessionKey });
       session = this.claudeHandler.createSession(user, channel, sessionThreadTs);
       isNewSession = true;
-    } else {
-      this.logger.debug('Using existing session', { sessionKey, sessionId: session.sessionId });
     }
 
-    // Send welcome message with quick commands for new sessions
     if (isNewSession) {
-      await say({
-        text: `🔧 *OpenClaw 紧急修复通道已就绪*\n工作目录: \`${workingDirectory}\`\n\n📋 *快捷命令:*\n\`!status\` — 查看状态\n\`!restart\` — 重启 Gateway\n\`!logs\` — 查看日志\n\`!config\` — 查看配置\n\`!fix\` — 自动诊断修复\n\`!ps\` — 查看进程\n\`!model\` — 查看/切换模型\n\`!help\` — 显示帮助\n\n或者直接用自然语言描述你的问题。`,
-        ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}),
-      });
+      await say({ text: formatWelcomeMessage(workingDirectory), ...replyOpts });
     }
 
     let currentMessages: string[] = [];
     let statusMessageTs: string | undefined;
 
     try {
-      // Prepare the prompt with file attachments
-      const finalPrompt = processedFiles.length > 0 
+      const finalPrompt = processedFiles.length > 0
         ? await this.fileHandler.formatFilePrompt(processedFiles, text || '')
         : text || '';
 
-      this.logger.info('Sending query to Claude Code SDK', { 
-        prompt: finalPrompt.substring(0, 200) + (finalPrompt.length > 200 ? '...' : ''), 
-        sessionId: session.sessionId,
-        workingDirectory,
-        fileCount: processedFiles.length,
+      this.logger.info('Sending query to Claude', {
+        prompt: finalPrompt.substring(0, 200) + (finalPrompt.length > 200 ? '...' : ''),
+        sessionId: session.sessionId, workingDirectory, fileCount: processedFiles.length,
       });
 
-      // Send initial status message
-      const statusResult = await say({
-        text: '🤔 *Thinking...*',
-        ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}),
-      });
+      const statusResult = await say({ text: '🤔 *Thinking...*', ...replyOpts });
       statusMessageTs = statusResult.ts;
-
-      // Add thinking reaction to original message (but don't spam if already set)
       await this.updateMessageReaction(sessionKey, 'thinking_face');
-      
-      // Create Slack context for permission prompts
-      const slackContext = {
-        channel,
-        threadTs: thread_ts,
-        user
-      };
-      
+
+      const slackContext = { channel, threadTs: thread_ts, user };
+
       for await (const message of this.claudeHandler.streamQuery(finalPrompt, session, abortController, workingDirectory, slackContext)) {
         if (abortController.signal.aborted) break;
 
-        this.logger.debug('Received message from Claude SDK', {
-          type: message.type,
-          subtype: (message as any).subtype,
-          message: message,
-        });
-
         if (message.type === 'assistant') {
-          // Check if this is a tool use message
           const hasToolUse = message.message.content?.some((part: any) => part.type === 'tool_use');
-          
-          if (hasToolUse) {
-            // Update status to show working
-            if (statusMessageTs) {
-              await this.app.client.chat.update({
-                channel,
-                ts: statusMessageTs,
-                text: '⚙️ *Working...*',
-              });
-            }
 
-            // Update reaction to show working
+          if (hasToolUse) {
+            if (statusMessageTs) {
+              await this.app.client.chat.update({ channel, ts: statusMessageTs, text: '⚙️ *Working...*' });
+            }
             await this.updateMessageReaction(sessionKey, 'gear');
 
-            // Check for TodoWrite tool and handle it specially
-            const todoTool = message.message.content?.find((part: any) => 
-              part.type === 'tool_use' && part.name === 'TodoWrite'
-            );
-
+            const todoTool = message.message.content?.find((part: any) => part.type === 'tool_use' && part.name === 'TodoWrite');
             if (todoTool) {
               await this.handleTodoUpdate((todoTool as any).input, sessionKey, session?.sessionId, channel, replyThreadTs || ts, say);
             }
 
-            // For other tool use messages, format them immediately as new messages
             const toolContent = this.formatToolUse(message.message.content);
-            if (toolContent) { // Only send if there's content (TodoWrite returns empty string)
-              await say({
-                text: toolContent,
-                ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}),
-              });
+            if (toolContent) {
+              await say({ text: toolContent, ...replyOpts });
             }
           } else {
-            // Handle regular text content
             const content = this.extractTextContent(message);
             if (content) {
               currentMessages.push(content);
-
-              // Send each new piece of content, splitting if too long for Slack
-              const formatted = this.formatMessage(content, false);
-              for (const chunk of this.splitMessage(formatted)) {
-                await say({
-                  text: chunk,
-                  ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}),
-                });
+              for (const chunk of this.splitMessage(this.formatMessage(content, false))) {
+                await say({ text: chunk, ...replyOpts });
               }
             }
           }
         } else if (message.type === 'result') {
-          this.logger.info('Received result from Claude SDK', {
-            subtype: message.subtype,
-            hasResult: message.subtype === 'success' && !!(message as any).result,
-            totalCost: (message as any).total_cost_usd,
-            duration: (message as any).duration_ms,
+          this.logger.info('Result received', {
+            subtype: message.subtype, totalCost: (message as any).total_cost_usd, duration: (message as any).duration_ms,
           });
-          
           if (message.subtype === 'success' && (message as any).result) {
             const finalResult = (message as any).result;
             if (finalResult && !currentMessages.includes(finalResult)) {
-              const formatted = this.formatMessage(finalResult, true);
-              for (const chunk of this.splitMessage(formatted)) {
-                await say({
-                  text: chunk,
-                  ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}),
-                });
+              for (const chunk of this.splitMessage(this.formatMessage(finalResult, true))) {
+                await say({ text: chunk, ...replyOpts });
               }
             }
           }
         }
       }
 
-      // Update status to completed
       if (statusMessageTs) {
-        await this.app.client.chat.update({
-          channel,
-          ts: statusMessageTs,
-          text: '✅ *Task completed*',
-        });
+        await this.app.client.chat.update({ channel, ts: statusMessageTs, text: '✅ *Task completed*' });
       }
-
-      // Update reaction to show completion
       await this.updateMessageReaction(sessionKey, 'white_check_mark');
+      this.logger.info('Completed', { sessionKey, messageCount: currentMessages.length });
 
-      this.logger.info('Completed processing message', {
-        sessionKey,
-        messageCount: currentMessages.length,
-      });
-
-      // Clean up temporary files
-      if (processedFiles.length > 0) {
-        await this.fileHandler.cleanupTempFiles(processedFiles);
-      }
+      if (processedFiles.length > 0) await this.fileHandler.cleanupTempFiles(processedFiles);
     } catch (error: any) {
       try {
         if (error.name !== 'AbortError') {
           this.logger.error('Error handling message', error);
-
-          if (statusMessageTs) {
-            await this.app.client.chat.update({
-              channel,
-              ts: statusMessageTs,
-              text: '❌ *Error occurred*',
-            });
-          }
-
+          if (statusMessageTs) await this.app.client.chat.update({ channel, ts: statusMessageTs, text: '❌ *Error occurred*' });
           await this.updateMessageReaction(sessionKey, 'x');
-
-          await say({
-            text: `Error: ${error.message || 'Something went wrong'}`,
-            ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}),
-          });
+          await say({ text: `Error: ${error.message || 'Something went wrong'}`, ...replyOpts });
         } else {
-          this.logger.debug('Request was aborted', { sessionKey });
-
-          if (statusMessageTs) {
-            await this.app.client.chat.update({
-              channel,
-              ts: statusMessageTs,
-              text: '⏹️ *Cancelled*',
-            });
-          }
-
+          this.logger.debug('Request aborted', { sessionKey });
+          if (statusMessageTs) await this.app.client.chat.update({ channel, ts: statusMessageTs, text: '⏹️ *Cancelled*' });
           await this.updateMessageReaction(sessionKey, 'stop_button');
         }
       } catch (cleanupError) {
-        this.logger.error('Error during error handling cleanup', cleanupError);
+        this.logger.error('Error during cleanup', cleanupError);
       }
-
-      // Clean up temporary files in case of error too
-      if (processedFiles.length > 0) {
-        await this.fileHandler.cleanupTempFiles(processedFiles);
-      }
+      if (processedFiles.length > 0) await this.fileHandler.cleanupTempFiles(processedFiles);
     } finally {
       this.activeControllers.delete(sessionKey);
-      
-      // Clean up todo tracking if session ended
       if (session?.sessionId) {
-        // Don't immediately clean up - keep todos visible for a while
         setTimeout(() => {
           this.todoManager.cleanupSession(session.sessionId!);
           this.todoMessages.delete(sessionKey);
           this.originalMessages.delete(sessionKey);
           this.currentReactions.delete(sessionKey);
-        }, 5 * 60 * 1000); // 5 minutes
+        }, 5 * 60 * 1000);
       }
     }
   }

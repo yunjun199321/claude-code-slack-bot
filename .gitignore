@@ -8,6 +8,7 @@ node_modules/
 .env.*.local
 
 mcp-servers.json
+bot-config.json
 
 # Build output
 dist/

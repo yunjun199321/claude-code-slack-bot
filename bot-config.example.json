@@ -1,0 +1,10 @@
+{
+  "welcomeMessage": "🤖 *Claude Code Bot is ready*\nWorking directory: `{{workingDirectory}}`\n\n📋 *Quick commands:*\n`!help` — Show all commands\n`!model` — Show/switch model\n`!new` — Reset session\n`!context` — Show current context\n\nOr just describe what you need in natural language.",
+  "shortcuts": {
+    "status": "Show the current system status",
+    "logs": "Show recent application logs",
+    "config": "Show the current configuration summary",
+    "fix": "Diagnose and suggest fixes for current issues",
+    "ps": "Run: ps aux | grep node | grep -v grep"
+  }
+}
