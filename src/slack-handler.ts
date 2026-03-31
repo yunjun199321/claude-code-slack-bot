@@ -1,6 +1,6 @@
 import { App } from '@slack/bolt';
 import { ClaudeHandler } from './claude-handler';
-import { SDKMessage } from '@anthropic-ai/claude-code';
+import { SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 import { Logger } from './logger';
 import { WorkingDirectoryManager } from './working-directory-manager';
 import { FileHandler, ProcessedFile } from './file-handler';
@@ -381,7 +381,7 @@ export class SlackHandler {
             );
 
             if (todoTool) {
-              await this.handleTodoUpdate(todoTool.input, sessionKey, session?.sessionId, channel, replyThreadTs || ts, say);
+              await this.handleTodoUpdate((todoTool as any).input, sessionKey, session?.sessionId, channel, replyThreadTs || ts, say);
             }
 
             // For other tool use messages, format them immediately as new messages
