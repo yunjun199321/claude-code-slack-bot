@@ -29,7 +29,7 @@ async function start() {
     // Initialize MCP manager
     const mcpManager = new McpManager();
     const mcpConfig = mcpManager.loadConfiguration();
-    
+
     // Initialize handlers
     const claudeHandler = new ClaudeHandler(mcpManager);
     const slackHandler = new SlackHandler(app, claudeHandler, mcpManager);
@@ -37,9 +37,36 @@ async function start() {
     // Setup event handlers
     slackHandler.setupEventHandlers();
 
+    // Graceful shutdown
+    let shuttingDown = false;
+    async function gracefulShutdown(signal: string) {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      logger.info(`Received ${signal}, shutting down gracefully...`);
+
+      // Cancel all active Claude requests
+      slackHandler.cancelAllActive();
+
+      // Clean up working directory manager timers
+      slackHandler.destroy();
+
+      // Stop Slack app
+      try {
+        await app.stop();
+        logger.info('Slack app stopped');
+      } catch (err) {
+        logger.error('Error stopping Slack app', err);
+      }
+
+      process.exit(0);
+    }
+
+    process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+    process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
     // Start the app
     await app.start();
-    logger.info('⚡️ Claude Code Slack bot is running!');
+    logger.info('Claude Code Slack bot is running!');
     logger.info('Configuration:', {
       usingBedrock: config.claude.useBedrock,
       usingVertex: config.claude.useVertex,

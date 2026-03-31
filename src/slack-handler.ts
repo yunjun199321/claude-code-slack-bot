@@ -39,6 +39,7 @@ export class SlackHandler {
   private originalMessages: Map<string, { channel: string; ts: string }> = new Map(); // sessionKey -> original message info
   private currentReactions: Map<string, string> = new Map(); // sessionKey -> current emoji
   private botUserId: string | null = null;
+  private cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(app: App, claudeHandler: ClaudeHandler, mcpManager: McpManager) {
     this.app = app;
@@ -883,9 +884,24 @@ export class SlackHandler {
     });
 
     // Cleanup inactive sessions periodically
-    setInterval(() => {
+    this.cleanupTimer = setInterval(() => {
       this.logger.debug('Running session cleanup');
       this.claudeHandler.cleanupInactiveSessions();
     }, 5 * 60 * 1000); // Every 5 minutes
+  }
+
+  cancelAllActive(): void {
+    for (const [key, controller] of this.activeControllers.entries()) {
+      this.logger.info('Cancelling active session', { key });
+      controller.abort();
+    }
+    this.activeControllers.clear();
+  }
+
+  destroy(): void {
+    if (this.cleanupTimer) {
+      clearInterval(this.cleanupTimer);
+    }
+    this.workingDirManager.destroy();
   }
 }
