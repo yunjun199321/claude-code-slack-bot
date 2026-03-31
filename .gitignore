@@ -23,6 +23,10 @@ dist/
 .DS_Store
 Thumbs.db
 
+# Backups & workspace
+*.bak
+*.code-workspace
+
 # Logs
 logs/
 *.log

@@ -2,8 +2,13 @@
 # CC Slack Bot launcher — sources .env and starts the bot
 cd "$(dirname "$0")"
 
-export PATH="/Users/yunjun-mini/.nvm/versions/node/v22.22.1/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-export HOME="/Users/yunjun-mini"
+export HOME="${HOME:-/Users/yunjun-mini}"
+
+# Load nvm to get the correct Node.js version
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+
+export PATH="$HOME/.nvm/versions/node/$(node -v 2>/dev/null || echo v22)/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 # Source .env file
 set -a
