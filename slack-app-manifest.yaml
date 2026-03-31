@@ -18,6 +18,7 @@ oauth_config:
       - channels:history
       - chat:write
       - chat:write.public
+      - files:read
       - im:history
       - im:read
       - im:write
@@ -31,7 +32,7 @@ settings:
       - message.im
       - member_joined_channel
   interactivity:
-    is_enabled: false
+    is_enabled: true
   org_deploy_enabled: false
   socket_mode_enabled: true
   token_rotation_enabled: false

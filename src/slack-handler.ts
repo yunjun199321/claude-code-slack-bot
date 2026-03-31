@@ -6,7 +6,7 @@ import { WorkingDirectoryManager } from './working-directory-manager';
 import { FileHandler, ProcessedFile } from './file-handler';
 import { TodoManager, Todo } from './todo-manager';
 import { McpManager } from './mcp-manager';
-import { permissionServer } from './permission-mcp-server';
+import { writeApprovalResult, cleanupStaleApprovals } from './permission-bridge';
 import { config } from './config';
 import { RateLimiter } from './rate-limiter';
 
@@ -86,7 +86,11 @@ export class SlackHandler {
       fileCount: files?.length || 0,
     });
 
-    const isAdmin = config.adminUsers.length === 0 || config.adminUsers.includes(user);
+    // If ADMIN_USERS is not configured, only the bot's first DM user gets admin.
+    // Otherwise, check the explicit whitelist.
+    const isAdmin = config.adminUsers.length > 0
+      ? config.adminUsers.includes(user)
+      : false; // No ADMIN_USERS = no admin commands for anyone
 
     // Handle !model — show or switch model
     if (text && /^[!/]model(\s+\S+)?$/.test(text.trim())) {
@@ -921,7 +925,7 @@ export class SlackHandler {
       const approver = (body as any).user?.id || 'unknown';
       this.logger.audit('permission.approved', { approvalId, approver });
 
-      permissionServer.resolveApproval(approvalId, true);
+      writeApprovalResult(approvalId, true);
 
       await respond({
         response_type: 'ephemeral',
@@ -936,7 +940,7 @@ export class SlackHandler {
       const denier = (body as any).user?.id || 'unknown';
       this.logger.audit('permission.denied', { approvalId, denier });
 
-      permissionServer.resolveApproval(approvalId, false);
+      writeApprovalResult(approvalId, false);
 
       await respond({
         response_type: 'ephemeral',
@@ -948,6 +952,7 @@ export class SlackHandler {
     this.cleanupTimer = setInterval(() => {
       this.logger.debug('Running session cleanup');
       this.claudeHandler.cleanupInactiveSessions();
+      cleanupStaleApprovals();
     }, 5 * 60 * 1000); // Every 5 minutes
   }
 

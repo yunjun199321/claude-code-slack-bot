@@ -8,6 +8,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { WebClient } from '@slack/web-api';
 import { Logger } from './logger.js';
+import { waitForApprovalResult } from './permission-bridge.js';
 
 const logger = new Logger('PermissionMCP');
 
@@ -28,10 +29,6 @@ interface PermissionResponse {
 class PermissionMCPServer {
   private server: Server;
   private slack: WebClient;
-  private pendingApprovals = new Map<string, {
-    resolve: (response: PermissionResponse) => void;
-    reject: (error: Error) => void;
-  }>();
 
   constructor() {
     this.server = new Server(
@@ -98,26 +95,25 @@ class PermissionMCPServer {
 
   private async handlePermissionPrompt(params: PermissionRequest) {
     const { tool_name, input } = params;
-    
+
     // Get Slack context from environment (passed by Claude handler)
     const slackContextStr = process.env.SLACK_CONTEXT;
     const slackContext = slackContextStr ? JSON.parse(slackContextStr) : {};
     const { channel, threadTs: thread_ts, user } = slackContext;
-    
+
     // Generate unique approval ID
     const approvalId = `approval_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    
+
     // Create approval message with buttons
+    const inputStr = JSON.stringify(input, null, 2);
+    const truncated = inputStr.length > 2000 ? inputStr.substring(0, 2000) + '\n...(truncated)' : inputStr;
+
     const blocks = [
       {
         type: "section",
         text: {
           type: "mrkdwn",
-          text: (() => {
-            const inputStr = JSON.stringify(input, null, 2);
-            const truncated = inputStr.length > 2000 ? inputStr.substring(0, 2000) + '\n...(truncated)' : inputStr;
-            return `🔐 *Permission Request*\n\nClaude wants to use the tool: \`${tool_name}\`\n\n*Tool Parameters:*\n\`\`\`json\n${truncated}\n\`\`\``;
-          })()
+          text: `🔐 *Permission Request*\n\nClaude wants to use the tool: \`${tool_name}\`\n\n*Tool Parameters:*\n\`\`\`json\n${truncated}\n\`\`\``
         }
       },
       {
@@ -125,20 +121,14 @@ class PermissionMCPServer {
         elements: [
           {
             type: "button",
-            text: {
-              type: "plain_text",
-              text: "✅ Approve"
-            },
+            text: { type: "plain_text", text: "✅ Approve" },
             style: "primary",
             action_id: "approve_tool",
             value: approvalId
           },
           {
             type: "button",
-            text: {
-              type: "plain_text",
-              text: "❌ Deny"
-            },
+            text: { type: "plain_text", text: "❌ Deny" },
             style: "danger",
             action_id: "deny_tool",
             value: approvalId
@@ -162,14 +152,20 @@ class PermissionMCPServer {
         channel: channel || user || 'general',
         thread_ts: thread_ts,
         blocks,
-        text: `Permission request for ${tool_name}` // Fallback text
+        text: `Permission request for ${tool_name}`
       });
 
-      // Wait for user response
-      const response = await this.waitForApproval(approvalId);
-      
+      // Wait for approval via file-based IPC bridge (works across processes)
+      const approvalResult = await waitForApprovalResult(approvalId);
+
+      const response: PermissionResponse = {
+        behavior: approvalResult.approved ? 'allow' : 'deny',
+        message: approvalResult.approved ? 'Approved by user' : 'Denied by user'
+      };
+
       // Update the message to show the result
       if (result.ts) {
+        const statusText = response.behavior === 'allow' ? '✅ Approved' : '❌ Denied';
         await this.slack.chat.update({
           channel: result.channel!,
           ts: result.ts,
@@ -178,7 +174,7 @@ class PermissionMCPServer {
               type: "section",
               text: {
                 type: "mrkdwn",
-                text: `🔐 *Permission Request* - ${response.behavior === 'allow' ? '✅ Approved' : '❌ Denied'}\n\nTool: \`${tool_name}\`\n\n*Tool Parameters:*\n\`\`\`json\n${JSON.stringify(input, null, 2)}\n\`\`\``
+                text: `🔐 *Permission Request* - ${statusText}\n\nTool: \`${tool_name}\`\n\n*Tool Parameters:*\n\`\`\`json\n${truncated}\n\`\`\``
               }
             },
             {
@@ -186,7 +182,7 @@ class PermissionMCPServer {
               elements: [
                 {
                   type: "mrkdwn",
-                  text: `${response.behavior === 'allow' ? 'Approved' : 'Denied'} by user | Tool: ${tool_name}`
+                  text: `${statusText} by user | Tool: ${tool_name}`
                 }
               ]
             }
@@ -196,61 +192,20 @@ class PermissionMCPServer {
       }
 
       return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(response)
-          }
-        ]
+        content: [{ type: "text", text: JSON.stringify(response) }]
       };
     } catch (error) {
       logger.error('Error handling permission prompt:', error);
-      
-      // Default to deny if there's an error
-      const response: PermissionResponse = {
-        behavior: 'deny',
-        message: 'Error occurred while requesting permission'
-      };
 
       return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(response)
-          }
-        ]
-      };
-    }
-  }
-
-  private async waitForApproval(approvalId: string): Promise<PermissionResponse> {
-    return new Promise((resolve, reject) => {
-      // Store the promise resolvers
-      this.pendingApprovals.set(approvalId, { resolve, reject });
-      
-      // Set timeout (5 minutes)
-      setTimeout(() => {
-        if (this.pendingApprovals.has(approvalId)) {
-          this.pendingApprovals.delete(approvalId);
-          resolve({
+        content: [{
+          type: "text",
+          text: JSON.stringify({
             behavior: 'deny',
-            message: 'Permission request timed out'
-          });
-        }
-      }, 5 * 60 * 1000);
-    });
-  }
-
-  // Method to be called by Slack handler when button is clicked
-  public resolveApproval(approvalId: string, approved: boolean, updatedInput?: any) {
-    const pending = this.pendingApprovals.get(approvalId);
-    if (pending) {
-      this.pendingApprovals.delete(approvalId);
-      pending.resolve({
-        behavior: approved ? 'allow' : 'deny',
-        updatedInput: updatedInput || undefined,
-        message: approved ? 'Approved by user' : 'Denied by user'
-      });
+            message: 'Error occurred while requesting permission'
+          } as PermissionResponse)
+        }]
+      };
     }
   }
 
@@ -261,13 +216,9 @@ class PermissionMCPServer {
   }
 }
 
-// Export singleton instance for use by Slack handler
-export const permissionServer = new PermissionMCPServer();
-
-// Run if this file is executed directly
-if (require.main === module) {
-  permissionServer.run().catch((error) => {
-    logger.error('Permission MCP server error:', error);
-    process.exit(1);
-  });
-}
+// Run if this file is executed directly (as subprocess by Claude SDK)
+const server = new PermissionMCPServer();
+server.run().catch((error) => {
+  logger.error('Permission MCP server error:', error);
+  process.exit(1);
+});

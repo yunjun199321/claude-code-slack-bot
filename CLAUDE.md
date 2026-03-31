@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A TypeScript Slack bot that wraps the `@anthropic-ai/claude-code` SDK. The bot is customized as **OpenClaw SRE** — an SRE assistant for the OpenClaw platform running on the user's Mac Mini (`yunjun-mini`). The system prompt (defined inline in `src/claude-handler.ts`) is in Chinese and contains detailed OpenClaw-specific runbooks, agent/workspace mappings, and red-line rules.
+A TypeScript Slack bot that wraps the `@anthropic-ai/claude-agent-sdk`. The bot is customized as **OpenClaw SRE** — an SRE assistant for the OpenClaw platform running on the user's Mac Mini (`yunjun-mini`). The system prompt is loaded from `prompts/system-prompt.md` (overridable via `SYSTEM_PROMPT_PATH` env var) and contains detailed OpenClaw-specific runbooks, agent/workspace mappings, and red-line rules in Chinese.
 
 ## Commands
 
@@ -13,49 +13,51 @@ npm run dev       # Run with tsx watch (hot reload), reads .env automatically
 npm start         # Run once with tsx (no hot reload)
 npm run build     # Compile to dist/ via tsc
 npm run prod      # Run compiled output from dist/
+npm test          # Run vitest test suite
+npm run test:watch # Run vitest in watch mode
 
 # Production launcher (used by LaunchAgent):
-./start.sh        # Sources .env, sets PATH, runs tsx src/index.ts
+./start.sh        # Sources .env, loads nvm, runs tsx src/index.ts
 ```
-
-No test suite exists in this project.
 
 ## Architecture
 
 ### Request flow
 
-1. **`src/index.ts`** — boots Slack app (Socket Mode), initializes `McpManager` → `ClaudeHandler` → `SlackHandler`, then calls `setupEventHandlers()`.
-2. **`src/slack-handler.ts`** — the main controller. Handles all Slack events: DMs, `app_mention`, file uploads, `member_joined_channel`, interactive button clicks (approve/deny). Dispatches to `ClaudeHandler.streamQuery()` and formats responses back to Slack.
-3. **`src/claude-handler.ts`** — wraps `query()` from `@anthropic-ai/claude-code`. Manages sessions keyed by `${userId}-${channelId}-${threadTs|'direct'}`. Each call to `streamQuery()` yields `SDKMessage` events. Session IDs from the SDK's `system/init` message are stored so subsequent calls use `options.resume`.
-4. **`src/permission-mcp-server.ts`** — an in-process MCP server (also spawnable as a child process) that implements `permission_prompt`. When Claude wants to execute a tool, it can call this to post an interactive Slack message with Approve/Deny buttons. `SlackHandler` wires up the button clicks to `permissionServer.resolveApproval()`.
+1. **`src/index.ts`** — boots Slack app (Socket Mode), initializes `McpManager` → `ClaudeHandler` → `SlackHandler`, sets up event handlers and graceful shutdown (SIGTERM/SIGINT).
+2. **`src/slack-handler.ts`** — the main controller. Handles all Slack events: DMs, `app_mention`, file uploads, `member_joined_channel`, interactive button clicks (approve/deny). Includes per-user rate limiting and admin authorization for destructive commands.
+3. **`src/claude-handler.ts`** — wraps `query()` from `@anthropic-ai/claude-agent-sdk`. Manages sessions keyed by `${userId}-${channelId}-${threadTs|'direct'}`. System prompt loaded from external file at startup.
+4. **`src/permission-mcp-server.ts`** — spawned as a subprocess by Claude SDK. Posts Slack messages with Approve/Deny buttons. Uses file-based IPC (`src/permission-bridge.ts`) to receive approval decisions from the main process.
 
 ### Key data flows
 
-**Session keying**: DMs use `userId-channelId-direct` (no thread isolation); channel threads use `userId-channelId-{threadTs}`. This means DMs share one continuous context, while each channel thread gets its own.
+**Session keying**: DMs use `userId-channelId-direct` (no thread isolation); channel threads use `userId-channelId-{threadTs}`. DMs share one continuous context; each channel thread gets its own.
 
-**Working directory hierarchy** (`src/working-directory-manager.ts`): thread-specific > channel default > DM-specific. Set with `cwd <path>`. If `BASE_DIRECTORY` env is set, short names resolve against it. A working directory is **required** — messages without one are rejected with guidance.
+**Working directory hierarchy** (`src/working-directory-manager.ts`): thread-specific > channel default > `DEFAULT_WORKING_DIRECTORY` env. Set with `cwd <path>`. If `BASE_DIRECTORY` env is set, short names resolve against it. A working directory is **required** — messages without one are rejected with guidance. No fallback to `$HOME`.
 
-**Todo tracking** (`src/todo-manager.ts`): When Claude calls `TodoWrite`, `SlackHandler` intercepts it (returns empty string to suppress the tool message), then posts/updates a dedicated Slack message with the formatted task list. This message is updated in-place via `chat.update` rather than spamming new messages.
+**Permission bridge** (`src/permission-bridge.ts`): File-based IPC between the main process and MCP subprocess. The subprocess writes approval requests and polls for result files; the main process writes results when Slack buttons are clicked.
 
-**MCP servers** (`src/mcp-manager.ts`): Loaded from `mcp-servers.json` at startup. All MCP tools allowed by default via `mcp__serverName` pattern. The `permission-prompt` MCP server is always injected when processing a Slack message (it needs `SLACK_CONTEXT` env to post buttons to the right channel/thread).
+**Todo tracking** (`src/todo-manager.ts`): When Claude calls `TodoWrite`, `SlackHandler` intercepts it, then posts/updates a dedicated Slack message with the formatted task list in-place.
+
+**MCP servers** (`src/mcp-manager.ts`): Loaded from `mcp-servers.json` at startup. The `permission-prompt` MCP server is always injected when processing a Slack message.
 
 ### Shortcut commands
 
 `SlackHandler.handleMessage()` intercepts several commands before hitting Claude:
 - `!new` / `/new` — delete the current SDK session (forces fresh context)
-- `!quit` / `/quit` — kill the tmux session (stops the bot)  
-- `!model [name|default]` — show or switch the model used in `ClaudeHandler`
+- `!quit` / `/quit` — kill the tmux session (**admin only**, requires `ADMIN_USERS`)
+- `!model [name|default]` — show or switch model (**admin only** to change)
 - `!status`, `!restart`, `!logs`, `!config`, `!fix`, `!ps` — expand to canned prompts sent to Claude
-- `cwd <path>` — set working directory (handled by `WorkingDirectoryManager`, not Claude)
-- `mcp [reload]` — show/reload MCP config (handled locally, not Claude)
+- `cwd <path>` — set working directory
+- `mcp [reload]` — show/reload MCP config
 
-### Files not in the original README
+### Key source files
 
-- `src/image-handler.ts` — separate image processing utilities
-- `src/permission-mcp-server.ts` — interactive permission prompts via Slack buttons
-- `src/permission-server-start.js` — standalone entrypoint to run the permission MCP server as a subprocess
-- `src/slack-handler.ts.bak` — stale backup, safe to ignore
-- `slack-app-manifest.json` / `slack-app-manifest.yaml` — Slack app configuration for creating/updating the app
+- `src/rate-limiter.ts` — sliding window per-user rate limiter
+- `src/permission-bridge.ts` — file-based IPC for cross-process permission approvals
+- `src/image-handler.ts` — image processing utilities
+- `prompts/system-prompt.md` — externalized system prompt (Chinese, OpenClaw SRE)
+- `vitest.config.ts` — test configuration (excludes dist/)
 
 ## Environment
 
@@ -68,6 +70,10 @@ ANTHROPIC_API_KEY=...
 
 # Optional
 BASE_DIRECTORY=/Users/yunjun-mini/Code/   # Enables short project names in cwd
+DEFAULT_WORKING_DIRECTORY=...             # Explicit default (no HOME fallback)
+SYSTEM_PROMPT_PATH=...                    # Override system prompt file path
+ADMIN_USERS=U123,U456                     # Comma-separated Slack user IDs for admin commands
+RATE_LIMIT_PER_MINUTE=10                  # Per-user rate limit (default: 10)
 DEBUG=true
 ```
 

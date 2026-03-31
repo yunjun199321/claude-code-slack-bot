@@ -154,8 +154,8 @@ export class WorkingDirectoryManager {
       return channelConfig.directory;
     }
 
-    // Fall back to DEFAULT_WORKING_DIRECTORY or HOME directory
-    const defaultDir = process.env.DEFAULT_WORKING_DIRECTORY || process.env.HOME;
+    // Only fall back to explicit DEFAULT_WORKING_DIRECTORY (never HOME)
+    const defaultDir = process.env.DEFAULT_WORKING_DIRECTORY;
     if (defaultDir && fs.existsSync(defaultDir)) {
       this.logger.debug('Using default working directory', { directory: defaultDir, channelId, threadTs });
       return defaultDir;
