@@ -398,13 +398,15 @@ export class SlackHandler {
             const content = this.extractTextContent(message);
             if (content) {
               currentMessages.push(content);
-              
-              // Send each new piece of content as a separate message
+
+              // Send each new piece of content, splitting if too long for Slack
               const formatted = this.formatMessage(content, false);
-              await say({
-                text: formatted,
-                ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}),
-              });
+              for (const chunk of this.splitMessage(formatted)) {
+                await say({
+                  text: chunk,
+                  ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}),
+                });
+              }
             }
           }
         } else if (message.type === 'result') {
@@ -419,10 +421,12 @@ export class SlackHandler {
             const finalResult = (message as any).result;
             if (finalResult && !currentMessages.includes(finalResult)) {
               const formatted = this.formatMessage(finalResult, true);
-              await say({
-                text: formatted,
-                ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}),
-              });
+              for (const chunk of this.splitMessage(formatted)) {
+                await say({
+                  text: chunk,
+                  ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}),
+                });
+              }
             }
           }
         }
@@ -816,6 +820,35 @@ export class SlackHandler {
       .replace(/__([^_]+)__/g, '_$1_');
 
     return formatted;
+  }
+
+  /**
+   * Split a long message into chunks that fit Slack's 4000-char limit.
+   * Splits at paragraph boundaries when possible to avoid breaking mid-sentence.
+   */
+  private splitMessage(text: string, maxLength: number = 3900): string[] {
+    if (text.length <= maxLength) return [text];
+
+    const chunks: string[] = [];
+    let remaining = text;
+
+    while (remaining.length > maxLength) {
+      // Try to split at a double newline (paragraph boundary)
+      let splitIdx = remaining.lastIndexOf('\n\n', maxLength);
+      // Fall back to single newline
+      if (splitIdx <= 0) splitIdx = remaining.lastIndexOf('\n', maxLength);
+      // Fall back to space
+      if (splitIdx <= 0) splitIdx = remaining.lastIndexOf(' ', maxLength);
+      // Last resort: hard split
+      if (splitIdx <= 0) splitIdx = maxLength;
+
+      chunks.push(remaining.substring(0, splitIdx));
+      remaining = remaining.substring(splitIdx).trimStart();
+    }
+    if (remaining.length > 0) {
+      chunks.push(remaining);
+    }
+    return chunks;
   }
 
   setupEventHandlers() {
