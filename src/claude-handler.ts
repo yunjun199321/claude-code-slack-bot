@@ -74,6 +74,11 @@ export class ClaudeHandler {
     workingDirectory?: string,
     slackContext?: { channel: string; threadTs?: string; user: string }
   ): AsyncGenerator<SDKMessage, void, unknown> {
+    // Update session activity timestamp to prevent premature cleanup
+    if (session) {
+      session.lastActivity = new Date();
+    }
+
     const options: any = {
       outputFormat: 'stream-json',
       permissionMode: 'bypassPermissions',

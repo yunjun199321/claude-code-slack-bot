@@ -10,9 +10,14 @@ export class Logger {
   private formatMessage(level: string, message: string, data?: any): string {
     const timestamp = new Date().toISOString();
     const prefix = `[${timestamp}] [${level}] [${this.context}]`;
-    
+
     if (data) {
-      return `${prefix} ${message}\n${JSON.stringify(data, null, 2)}`;
+      try {
+        return `${prefix} ${message}\n${JSON.stringify(data, null, 2)}`;
+      } catch {
+        // Handle circular references or non-serializable data
+        return `${prefix} ${message}\n[unserializable data]`;
+      }
     }
     return `${prefix} ${message}`;
   }

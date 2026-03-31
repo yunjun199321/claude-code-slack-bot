@@ -65,9 +65,8 @@ export class SlackHandler {
     // For session key: DMs use stable key (no thread_ts), channels use thread_ts
     const sessionThreadTs = isDM ? undefined : (thread_ts || ts);
     
-    // Rate limit check
+    // Rate limit check (before any expensive work)
     if (!this.rateLimiter.isAllowed(user)) {
-      const remaining = this.rateLimiter.getRemainingRequests(user);
       await say({
         text: `⚠️ 请求过于频繁，请稍后再试。(限制: ${process.env.RATE_LIMIT_PER_MINUTE || '10'} 次/分钟)`,
         ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}),
@@ -75,22 +74,8 @@ export class SlackHandler {
       return;
     }
 
-    // Process any attached files
-    let processedFiles: ProcessedFile[] = [];
-    if (files && files.length > 0) {
-      this.logger.info('Processing uploaded files', { count: files.length });
-      processedFiles = await this.fileHandler.downloadAndProcessFiles(files);
-      
-      if (processedFiles.length > 0) {
-        await say({
-          text: `📎 Processing ${processedFiles.length} file(s): ${processedFiles.map(f => f.name).join(', ')}`,
-          ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}),
-        });
-      }
-    }
-
     // If no text and no files, nothing to process
-    if (!text && processedFiles.length === 0) return;
+    if (!text && (!files || files.length === 0)) return;
 
     this.logger.debug('Received message from Slack', {
       user,
@@ -98,20 +83,26 @@ export class SlackHandler {
       thread_ts,
       ts,
       text: text ? text.substring(0, 100) + (text.length > 100 ? '...' : '') : '[no text]',
-      fileCount: processedFiles.length,
+      fileCount: files?.length || 0,
     });
+
+    const isAdmin = config.adminUsers.length === 0 || config.adminUsers.includes(user);
 
     // Handle !model — show or switch model
     if (text && /^[!/]model(\s+\S+)?$/.test(text.trim())) {
       const parts = text.trim().split(/\s+/);
       if (parts.length === 1) {
-        // Show current model
+        // Show current model (allowed for everyone)
         const current = this.claudeHandler.getModel();
         await say({
           text: `🤖 *当前模型:* \`${current || '(SDK 默认)'}\`\n\n可用命令:\n\`!model claude-opus-4-6\` — Opus 4.6（最强）\n\`!model claude-sonnet-4-6\` — Sonnet 4.6（平衡）\n\`!model claude-haiku-4-5-20251001\` — Haiku 4.5（快速）\n\`!model default\` — 恢复 SDK 默认`,
           ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}),
         });
       } else {
+        if (!isAdmin) {
+          await say({ text: '⛔ 仅管理员可以切换模型。', ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}) });
+          return;
+        }
         const newModel = parts[1];
         if (newModel === 'default') {
           this.claudeHandler.setModel(undefined);
@@ -144,8 +135,13 @@ export class SlackHandler {
       return;
     }
 
-    // Handle /quit and !quit — kill the current tmux session
+    // Handle /quit and !quit — kill the current tmux session (admin only)
     if (trimmedText === '/quit' || trimmedText === '!quit') {
+      if (!isAdmin) {
+        await say({ text: '⛔ 仅管理员可以关闭 Bot。', ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}) });
+        return;
+      }
+      this.logger.audit('command.quit', { user, channel });
       await say({
         text: `👋 *正在关闭 tmux 会话，Bot 即将停止运行。*`,
         ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}),
@@ -299,8 +295,22 @@ export class SlackHandler {
       return;
     }
 
+    // Process any attached files (after command checks to avoid temp file leaks)
+    let processedFiles: ProcessedFile[] = [];
+    if (files && files.length > 0) {
+      this.logger.info('Processing uploaded files', { count: files.length });
+      processedFiles = await this.fileHandler.downloadAndProcessFiles(files);
+
+      if (processedFiles.length > 0) {
+        await say({
+          text: `📎 Processing ${processedFiles.length} file(s): ${processedFiles.map(f => f.name).join(', ')}`,
+          ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}),
+        });
+      }
+    }
+
     const sessionKey = this.claudeHandler.getSessionKey(user, channel, sessionThreadTs);
-    
+
     // Store the original message info for status reactions
     const originalMessageTs = replyThreadTs || ts;
     this.originalMessages.set(sessionKey, { channel, ts: originalMessageTs });
@@ -357,7 +367,7 @@ export class SlackHandler {
       statusMessageTs = statusResult.ts;
 
       // Add thinking reaction to original message (but don't spam if already set)
-      await this.updateMessageReaction(sessionKey, '🤔');
+      await this.updateMessageReaction(sessionKey, 'thinking_face');
       
       // Create Slack context for permission prompts
       const slackContext = {
@@ -390,7 +400,7 @@ export class SlackHandler {
             }
 
             // Update reaction to show working
-            await this.updateMessageReaction(sessionKey, '⚙️');
+            await this.updateMessageReaction(sessionKey, 'gear');
 
             // Check for TodoWrite tool and handle it specially
             const todoTool = message.message.content?.find((part: any) => 
@@ -458,7 +468,7 @@ export class SlackHandler {
       }
 
       // Update reaction to show completion
-      await this.updateMessageReaction(sessionKey, '✅');
+      await this.updateMessageReaction(sessionKey, 'white_check_mark');
 
       this.logger.info('Completed processing message', {
         sessionKey,
@@ -470,39 +480,39 @@ export class SlackHandler {
         await this.fileHandler.cleanupTempFiles(processedFiles);
       }
     } catch (error: any) {
-      if (error.name !== 'AbortError') {
-        this.logger.error('Error handling message', error);
-        
-        // Update status to error
-        if (statusMessageTs) {
-          await this.app.client.chat.update({
-            channel,
-            ts: statusMessageTs,
-            text: '❌ *Error occurred*',
-          });
-        }
+      try {
+        if (error.name !== 'AbortError') {
+          this.logger.error('Error handling message', error);
 
-        // Update reaction to show error
-        await this.updateMessageReaction(sessionKey, '❌');
-        
-        await say({
-          text: `Error: ${error.message || 'Something went wrong'}`,
-          ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}),
-        });
-      } else {
-        this.logger.debug('Request was aborted', { sessionKey });
-        
-        // Update status to cancelled
-        if (statusMessageTs) {
-          await this.app.client.chat.update({
-            channel,
-            ts: statusMessageTs,
-            text: '⏹️ *Cancelled*',
-          });
-        }
+          if (statusMessageTs) {
+            await this.app.client.chat.update({
+              channel,
+              ts: statusMessageTs,
+              text: '❌ *Error occurred*',
+            });
+          }
 
-        // Update reaction to show cancellation
-        await this.updateMessageReaction(sessionKey, '⏹️');
+          await this.updateMessageReaction(sessionKey, 'x');
+
+          await say({
+            text: `Error: ${error.message || 'Something went wrong'}`,
+            ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}),
+          });
+        } else {
+          this.logger.debug('Request was aborted', { sessionKey });
+
+          if (statusMessageTs) {
+            await this.app.client.chat.update({
+              channel,
+              ts: statusMessageTs,
+              text: '⏹️ *Cancelled*',
+            });
+          }
+
+          await this.updateMessageReaction(sessionKey, 'stop_button');
+        }
+      } catch (cleanupError) {
+        this.logger.error('Error during error handling cleanup', cleanupError);
       }
 
       // Clean up temporary files in case of error too
@@ -759,11 +769,11 @@ export class SlackHandler {
 
     let emoji: string;
     if (completed === total) {
-      emoji = '✅'; // All tasks completed
+      emoji = 'white_check_mark';
     } else if (inProgress > 0) {
-      emoji = '🔄'; // Tasks in progress
+      emoji = 'arrows_counterclockwise';
     } else {
-      emoji = '📋'; // Tasks pending
+      emoji = 'clipboard';
     }
 
     await this.updateMessageReaction(sessionKey, emoji);

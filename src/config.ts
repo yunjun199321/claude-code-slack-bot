@@ -17,6 +17,7 @@ export const config = {
   },
   baseDirectory: process.env.BASE_DIRECTORY || '',
   debug: process.env.DEBUG === 'true' || process.env.NODE_ENV === 'development',
+  adminUsers: (process.env.ADMIN_USERS || '').split(',').map(s => s.trim()).filter(Boolean),
 };
 
 export function validateConfig() {

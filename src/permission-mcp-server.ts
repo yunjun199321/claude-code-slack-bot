@@ -113,7 +113,11 @@ class PermissionMCPServer {
         type: "section",
         text: {
           type: "mrkdwn",
-          text: `🔐 *Permission Request*\n\nClaude wants to use the tool: \`${tool_name}\`\n\n*Tool Parameters:*\n\`\`\`json\n${JSON.stringify(input, null, 2)}\n\`\`\``
+          text: (() => {
+            const inputStr = JSON.stringify(input, null, 2);
+            const truncated = inputStr.length > 2000 ? inputStr.substring(0, 2000) + '\n...(truncated)' : inputStr;
+            return `🔐 *Permission Request*\n\nClaude wants to use the tool: \`${tool_name}\`\n\n*Tool Parameters:*\n\`\`\`json\n${truncated}\n\`\`\``;
+          })()
         }
       },
       {
