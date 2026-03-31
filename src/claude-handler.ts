@@ -101,10 +101,13 @@ export class ClaudeHandler {
     
     // Add permission prompt server if we have Slack context
     if (slackContext) {
+      // Detect if running from compiled dist/ or source src/
+      const isCompiled = __filename.endsWith('.js');
+      const serverFile = path.join(__dirname, isCompiled ? 'permission-mcp-server.js' : 'permission-mcp-server.ts');
       const permissionServer = {
         'permission-prompt': {
-          command: 'npx',
-          args: ['tsx', require('path').join(__dirname, 'permission-mcp-server.ts')],
+          command: isCompiled ? 'node' : 'npx',
+          args: isCompiled ? [serverFile] : ['tsx', serverFile],
           env: {
             SLACK_BOT_TOKEN: process.env.SLACK_BOT_TOKEN,
             SLACK_CONTEXT: JSON.stringify(slackContext)
@@ -146,7 +149,16 @@ export class ClaudeHandler {
       this.logger.debug('Starting new Claude conversation');
     }
 
-    this.logger.debug('Claude query options', options);
+    this.logger.debug('Claude query options', {
+      outputFormat: options.outputFormat,
+      permissionMode: options.permissionMode,
+      model: options.model,
+      cwd: options.cwd,
+      hasSystemPrompt: !!options.systemPrompt,
+      hasResume: !!options.resume,
+      mcpServerNames: options.mcpServers ? Object.keys(options.mcpServers) : [],
+      allowedToolCount: options.allowedTools?.length,
+    });
 
     try {
       if (abortController) {

@@ -285,7 +285,7 @@ export class SlackHandler {
         : text || '';
 
       this.logger.info('Sending query to Claude', {
-        prompt: finalPrompt.substring(0, 200) + (finalPrompt.length > 200 ? '...' : ''),
+        promptLength: finalPrompt.length,
         sessionId: session.sessionId, workingDirectory, fileCount: processedFiles.length,
       });
 
