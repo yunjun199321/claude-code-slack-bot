@@ -1,230 +1,74 @@
-# Claude Code Slack Bot
+# CLAUDE.md
 
-This is a TypeScript-based Slack bot that integrates with the Claude Code SDK to provide AI-powered coding assistance directly within Slack workspaces.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Project Overview
+## What this is
 
-The bot allows users to interact with Claude Code through Slack, providing real-time coding assistance, file analysis, code reviews, and project management capabilities. It supports both direct messages and channel conversations, with sophisticated working directory management and task tracking.
+A TypeScript Slack bot that wraps the `@anthropic-ai/claude-code` SDK. The bot is customized as **OpenClaw SRE** — an SRE assistant for the OpenClaw platform running on the user's Mac Mini (`yunjun-mini`). The system prompt (defined inline in `src/claude-handler.ts`) is in Chinese and contains detailed OpenClaw-specific runbooks, agent/workspace mappings, and red-line rules.
+
+## Commands
+
+```bash
+npm run dev       # Run with tsx watch (hot reload), reads .env automatically
+npm start         # Run once with tsx (no hot reload)
+npm run build     # Compile to dist/ via tsc
+npm run prod      # Run compiled output from dist/
+
+# Production launcher (used by LaunchAgent):
+./start.sh        # Sources .env, sets PATH, runs tsx src/index.ts
+```
+
+No test suite exists in this project.
 
 ## Architecture
 
-### Core Components
+### Request flow
 
-- **`src/index.ts`** - Application entry point and initialization
-- **`src/config.ts`** - Environment configuration and validation
-- **`src/slack-handler.ts`** - Main Slack event handling and message processing
-- **`src/claude-handler.ts`** - Claude Code SDK integration and session management
-- **`src/working-directory-manager.ts`** - Working directory configuration and resolution
-- **`src/file-handler.ts`** - File upload processing and content embedding
-- **`src/todo-manager.ts`** - Task list management and progress tracking
-- **`src/mcp-manager.ts`** - MCP server configuration and management
-- **`src/logger.ts`** - Structured logging utility
-- **`src/types.ts`** - TypeScript type definitions
+1. **`src/index.ts`** — boots Slack app (Socket Mode), initializes `McpManager` → `ClaudeHandler` → `SlackHandler`, then calls `setupEventHandlers()`.
+2. **`src/slack-handler.ts`** — the main controller. Handles all Slack events: DMs, `app_mention`, file uploads, `member_joined_channel`, interactive button clicks (approve/deny). Dispatches to `ClaudeHandler.streamQuery()` and formats responses back to Slack.
+3. **`src/claude-handler.ts`** — wraps `query()` from `@anthropic-ai/claude-code`. Manages sessions keyed by `${userId}-${channelId}-${threadTs|'direct'}`. Each call to `streamQuery()` yields `SDKMessage` events. Session IDs from the SDK's `system/init` message are stored so subsequent calls use `options.resume`.
+4. **`src/permission-mcp-server.ts`** — an in-process MCP server (also spawnable as a child process) that implements `permission_prompt`. When Claude wants to execute a tool, it can call this to post an interactive Slack message with Approve/Deny buttons. `SlackHandler` wires up the button clicks to `permissionServer.resolveApproval()`.
 
-### Key Features
+### Key data flows
 
-#### 1. Working Directory Management
-- **Base Directory Support**: Configure a base directory (e.g., `/Users/username/Code/`) to use short project names
-- **Channel Defaults**: Each channel gets a default working directory when the bot is first added
-- **Thread Overrides**: Individual threads can override the channel default by mentioning the bot
-- **Hierarchy**: Thread-specific > Channel default > DM-specific
-- **Smart Resolution**: Supports both relative paths (`cwd project-name`) and absolute paths
+**Session keying**: DMs use `userId-channelId-direct` (no thread isolation); channel threads use `userId-channelId-{threadTs}`. This means DMs share one continuous context, while each channel thread gets its own.
 
-#### 2. Real-Time Task Tracking
-- **Todo Lists**: Displays Claude's planning process as formatted task lists in Slack
-- **Progress Updates**: Updates task status in real-time as Claude works
-- **Priority Indicators**: Visual priority levels (🔴 High, 🟡 Medium, 🟢 Low)
-- **Status Reactions**: Emoji reactions on original messages show overall progress
-- **Live Updates**: Single message updates instead of spam
+**Working directory hierarchy** (`src/working-directory-manager.ts`): thread-specific > channel default > DM-specific. Set with `cwd <path>`. If `BASE_DIRECTORY` env is set, short names resolve against it. A working directory is **required** — messages without one are rejected with guidance.
 
-#### 3. File Upload Support
-- **Multiple Formats**: Images (JPG, PNG, GIF, WebP), text files, code files, documents
-- **Content Embedding**: Text files are embedded directly in prompts
-- **Image Analysis**: Images are saved for Claude to analyze using the Read tool
-- **Size Limits**: 50MB file size limit with automatic cleanup
-- **Security**: Secure download using Slack bot token authentication
+**Todo tracking** (`src/todo-manager.ts`): When Claude calls `TodoWrite`, `SlackHandler` intercepts it (returns empty string to suppress the tool message), then posts/updates a dedicated Slack message with the formatted task list. This message is updated in-place via `chat.update` rather than spamming new messages.
 
-#### 4. Advanced Message Handling
-- **Streaming Responses**: Real-time message updates as Claude generates responses
-- **Tool Formatting**: Rich formatting for file edits, bash commands, and other tool usage
-- **Status Indicators**: Clear visual feedback (🤔 Thinking, ⚙️ Working, ✅ Completed)
-- **Error Handling**: Graceful error recovery with informative messages
-- **Session Management**: Conversation context maintained across interactions
+**MCP servers** (`src/mcp-manager.ts`): Loaded from `mcp-servers.json` at startup. All MCP tools allowed by default via `mcp__serverName` pattern. The `permission-prompt` MCP server is always injected when processing a Slack message (it needs `SLACK_CONTEXT` env to post buttons to the right channel/thread).
 
-#### 5. Channel Integration
-- **Auto-Setup**: Automatic welcome message when added to channels
-- **Mentions**: Responds to @mentions in channels
-- **Thread Support**: Maintains context within threaded conversations
-- **File Uploads**: Handles file uploads in any conversation context
+### Shortcut commands
 
-#### 6. MCP (Model Context Protocol) Integration
-- **External Tools**: Extends Claude's capabilities with external MCP servers
-- **Multiple Server Types**: Supports stdio, SSE, and HTTP MCP servers
-- **Auto-Configuration**: Loads servers from `mcp-servers.json` automatically
-- **Tool Management**: All MCP tools are allowed by default with `mcp__serverName__toolName` pattern
-- **Runtime Management**: Reload configuration without restarting the bot
-- **Popular Integrations**: Filesystem access, GitHub API, database connections, web search
+`SlackHandler.handleMessage()` intercepts several commands before hitting Claude:
+- `!new` / `/new` — delete the current SDK session (forces fresh context)
+- `!quit` / `/quit` — kill the tmux session (stops the bot)  
+- `!model [name|default]` — show or switch the model used in `ClaudeHandler`
+- `!status`, `!restart`, `!logs`, `!config`, `!fix`, `!ps` — expand to canned prompts sent to Claude
+- `cwd <path>` — set working directory (handled by `WorkingDirectoryManager`, not Claude)
+- `mcp [reload]` — show/reload MCP config (handled locally, not Claude)
 
-## Environment Configuration
+### Files not in the original README
 
-### Required Variables
+- `src/image-handler.ts` — separate image processing utilities
+- `src/permission-mcp-server.ts` — interactive permission prompts via Slack buttons
+- `src/permission-server-start.js` — standalone entrypoint to run the permission MCP server as a subprocess
+- `src/slack-handler.ts.bak` — stale backup, safe to ignore
+- `slack-app-manifest.json` / `slack-app-manifest.yaml` — Slack app configuration for creating/updating the app
+
+## Environment
+
 ```env
-# Slack App Configuration
-SLACK_BOT_TOKEN=xoxb-your-bot-token
-SLACK_APP_TOKEN=xapp-your-app-token  
-SLACK_SIGNING_SECRET=your-signing-secret
+# Required
+SLACK_BOT_TOKEN=xoxb-...
+SLACK_APP_TOKEN=xapp-...
+SLACK_SIGNING_SECRET=...
+ANTHROPIC_API_KEY=...
 
-# Claude Code Configuration
-ANTHROPIC_API_KEY=your-anthropic-api-key
-```
-
-### Optional Variables
-```env
-# Working Directory Configuration
-BASE_DIRECTORY=/Users/username/Code/
-
-# Third-party API Providers
-CLAUDE_CODE_USE_BEDROCK=1
-CLAUDE_CODE_USE_VERTEX=1
-
-# Development
+# Optional
+BASE_DIRECTORY=/Users/yunjun-mini/Code/   # Enables short project names in cwd
 DEBUG=true
 ```
 
-## Slack App Configuration
-
-### Required Permissions
-- `app_mentions:read` - Read mentions
-- `channels:history` - Read channel messages
-- `chat:write` - Send messages
-- `chat:write.public` - Write to public channels
-- `im:history` - Read direct messages
-- `im:read` - Basic DM info
-- `im:write` - Send direct messages
-- `users:read` - Read user information
-- `reactions:read` - Read message reactions
-- `reactions:write` - Add/remove reactions
-
-### Required Events
-- `app_mention` - When the bot is mentioned
-- `message.im` - Direct messages
-- `member_joined_channel` - When bot is added to channels
-
-### Socket Mode
-The bot uses Socket Mode for real-time event handling, requiring an app-level token with `connections:write` scope.
-
-## Usage Patterns
-
-### Channel Setup
-```
-1. Add bot to channel
-2. Bot sends welcome message asking for working directory
-3. Set default: `cwd project-name` or `cwd /absolute/path`
-4. Start using: `@ClaudeBot help me with authentication`
-```
-
-### Thread Overrides
-```
-@ClaudeBot cwd different-project
-@ClaudeBot now help me with this other codebase
-```
-
-### File Analysis
-```
-[Upload image/code file]
-Analyze this screenshot and suggest improvements
-```
-
-### Task Tracking
-Users see real-time task lists as Claude plans and executes work:
-```
-📋 Task List
-
-🔄 In Progress:
-🔴 Analyze authentication system
-
-⏳ Pending:  
-🟡 Implement OAuth flow
-🟢 Add error handling
-
-Progress: 1/3 tasks completed (33%)
-```
-
-### MCP Server Management
-```
-# View configured MCP servers
-User: mcp
-Bot: 🔧 MCP Servers Configured:
-     • filesystem (stdio)
-     • github (stdio)  
-     • postgres (stdio)
-
-# Reload MCP configuration
-User: mcp reload
-Bot: ✅ MCP configuration reloaded successfully.
-
-# Use MCP tools automatically
-User: @ClaudeBot list all TODO comments in the project
-Bot: [Uses mcp__filesystem tools to search files]
-```
-
-## Development
-
-### Build and Run
-```bash
-npm install
-npm run build
-npm run dev     # Development with hot reload
-npm run prod    # Production mode
-```
-
-### Project Structure
-```
-src/
-├── index.ts                      # Entry point
-├── config.ts                     # Configuration
-├── slack-handler.ts              # Slack event handling
-├── claude-handler.ts             # Claude Code SDK integration
-├── working-directory-manager.ts  # Directory management
-├── file-handler.ts               # File processing
-├── todo-manager.ts               # Task tracking
-├── mcp-manager.ts                # MCP server management
-├── logger.ts                     # Logging utility
-└── types.ts                      # Type definitions
-
-# Configuration files
-mcp-servers.json                  # MCP server configuration
-mcp-servers.example.json          # Example MCP configuration
-```
-
-### Key Design Decisions
-
-1. **Append-Only Messages**: Instead of editing a single message, each response is a separate message for better conversation flow
-2. **Session-Based Context**: Each conversation maintains its own Claude Code session for continuity
-3. **Smart File Handling**: Text content embedded in prompts, images passed as file paths for Claude to read
-4. **Hierarchical Working Directories**: Channel defaults with thread overrides for flexibility
-5. **Real-Time Feedback**: Status reactions and live task updates for transparency
-
-### Error Handling
-- Graceful degradation when Slack API calls fail
-- Automatic retry for transient errors
-- Comprehensive logging for debugging
-- User-friendly error messages
-- Automatic cleanup of temporary files
-
-### Security Considerations
-- Environment variables for sensitive configuration
-- Secure file download with proper authentication
-- Temporary file cleanup after processing
-- No storage of user data beyond session duration
-- Validation of file types and sizes
-
-## Future Enhancements
-
-Potential areas for expansion:
-- Persistent working directory storage (database)
-- Advanced file format support (PDFs, Office docs)
-- Integration with version control systems
-- Custom slash commands
-- Team-specific bot configurations
-- Analytics and usage tracking
+The bot runs via `~/Library/LaunchAgents/com.yunjun.cc-slack-bot.plist` in production.
