@@ -8,6 +8,7 @@ import { TodoManager, Todo } from './todo-manager';
 import { McpManager } from './mcp-manager';
 import { permissionServer } from './permission-mcp-server';
 import { config } from './config';
+import { RateLimiter } from './rate-limiter';
 
 interface MessageEvent {
   user: string;
@@ -40,6 +41,7 @@ export class SlackHandler {
   private currentReactions: Map<string, string> = new Map(); // sessionKey -> current emoji
   private botUserId: string | null = null;
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
+  private rateLimiter: RateLimiter;
 
   constructor(app: App, claudeHandler: ClaudeHandler, mcpManager: McpManager) {
     this.app = app;
@@ -48,6 +50,8 @@ export class SlackHandler {
     this.workingDirManager = new WorkingDirectoryManager();
     this.fileHandler = new FileHandler();
     this.todoManager = new TodoManager();
+    const rateLimit = parseInt(process.env.RATE_LIMIT_PER_MINUTE || '10', 10);
+    this.rateLimiter = new RateLimiter(rateLimit, 60 * 1000);
   }
 
   async handleMessage(event: MessageEvent, say: any) {
@@ -61,6 +65,16 @@ export class SlackHandler {
     // For session key: DMs use stable key (no thread_ts), channels use thread_ts
     const sessionThreadTs = isDM ? undefined : (thread_ts || ts);
     
+    // Rate limit check
+    if (!this.rateLimiter.isAllowed(user)) {
+      const remaining = this.rateLimiter.getRemainingRequests(user);
+      await say({
+        text: `⚠️ 请求过于频繁，请稍后再试。(限制: ${process.env.RATE_LIMIT_PER_MINUTE || '10'} 次/分钟)`,
+        ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}),
+      });
+      return;
+    }
+
     // Process any attached files
     let processedFiles: ProcessedFile[] = [];
     if (files && files.length > 0) {
@@ -936,5 +950,6 @@ export class SlackHandler {
       clearInterval(this.cleanupTimer);
     }
     this.workingDirManager.destroy();
+    this.rateLimiter.destroy();
   }
 }
