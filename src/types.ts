@@ -14,4 +14,5 @@ export interface WorkingDirectoryConfig {
   userId?: string;
   directory: string;
   setAt: Date;
+  lastAccessed: Date;
 }

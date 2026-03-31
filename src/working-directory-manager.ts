@@ -7,6 +7,35 @@ import * as fs from 'fs';
 export class WorkingDirectoryManager {
   private configs: Map<string, WorkingDirectoryConfig> = new Map();
   private logger = new Logger('WorkingDirectoryManager');
+  private cleanupTimer: ReturnType<typeof setInterval>;
+
+  constructor() {
+    // Clean up stale entries every 10 minutes
+    this.cleanupTimer = setInterval(() => this.cleanupStaleConfigs(), 10 * 60 * 1000);
+  }
+
+  /**
+   * Remove working directory configs that haven't been accessed for over 1 hour.
+   * Channel-level (non-thread) configs are kept longer (24 hours) since they serve as defaults.
+   */
+  cleanupStaleConfigs(threadMaxAge: number = 60 * 60 * 1000, channelMaxAge: number = 24 * 60 * 60 * 1000) {
+    const now = Date.now();
+    let cleaned = 0;
+    for (const [key, cfg] of this.configs.entries()) {
+      const maxAge = cfg.threadTs ? threadMaxAge : channelMaxAge;
+      if (now - cfg.lastAccessed.getTime() > maxAge) {
+        this.configs.delete(key);
+        cleaned++;
+      }
+    }
+    if (cleaned > 0) {
+      this.logger.info(`Cleaned up ${cleaned} stale working directory configs (remaining: ${this.configs.size})`);
+    }
+  }
+
+  destroy() {
+    clearInterval(this.cleanupTimer);
+  }
 
   getConfigKey(channelId: string, threadTs?: string, userId?: string): string {
     if (threadTs) {
@@ -37,12 +66,14 @@ export class WorkingDirectoryManager {
       }
 
       const key = this.getConfigKey(channelId, threadTs, userId);
+      const now = new Date();
       const workingDirConfig: WorkingDirectoryConfig = {
         channelId,
         threadTs,
         userId,
         directory: resolvedPath,
-        setAt: new Date(),
+        setAt: now,
+        lastAccessed: now,
       };
 
       this.configs.set(key, workingDirConfig);
@@ -102,6 +133,7 @@ export class WorkingDirectoryManager {
       const threadKey = this.getConfigKey(channelId, threadTs);
       const threadConfig = this.configs.get(threadKey);
       if (threadConfig) {
+        threadConfig.lastAccessed = new Date();
         this.logger.debug('Using thread-specific working directory', {
           directory: threadConfig.directory,
           threadTs,
@@ -114,6 +146,7 @@ export class WorkingDirectoryManager {
     const channelKey = this.getConfigKey(channelId, undefined, userId);
     const channelConfig = this.configs.get(channelKey);
     if (channelConfig) {
+      channelConfig.lastAccessed = new Date();
       this.logger.debug('Using channel/DM working directory', {
         directory: channelConfig.directory,
         channelId,
