@@ -39,4 +39,18 @@ export class Logger {
     } : error;
     console.error(this.formatMessage('ERROR', message, errorData));
   }
+
+  /**
+   * Structured audit log entry (JSON line format).
+   * Use for security-relevant events: commands, permission decisions, session lifecycle.
+   */
+  audit(event: string, data: Record<string, unknown>) {
+    console.log(JSON.stringify({
+      timestamp: new Date().toISOString(),
+      level: 'AUDIT',
+      context: this.context,
+      event,
+      ...data,
+    }));
+  }
 }

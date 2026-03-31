@@ -135,6 +135,7 @@ export class SlackHandler {
     if (trimmedText === '/new' || trimmedText === '!new') {
       // Clear the existing session for this DM/channel
       const oldSessionKey = this.claudeHandler.getSessionKey(user, channel, sessionThreadTs);
+      this.logger.audit('session.reset', { user, channel, sessionKey: oldSessionKey });
       this.claudeHandler.deleteSession(user, channel, sessionThreadTs);
       await say({
         text: `🔄 *会话已重置。* 新的 Claude Code 会话已准备就绪。`,
@@ -185,6 +186,7 @@ export class SlackHandler {
       }
 
       if (shortcuts[shortcut]) {
+        this.logger.audit('command.executed', { user, channel, command: shortcut });
         // Replace text with the expanded command and continue to Claude
         text = shortcuts[shortcut];
       }
@@ -906,10 +908,11 @@ export class SlackHandler {
     this.app.action('approve_tool', async ({ ack, body, respond }) => {
       await ack();
       const approvalId = (body as any).actions[0].value;
-      this.logger.info('Tool approval granted', { approvalId });
-      
+      const approver = (body as any).user?.id || 'unknown';
+      this.logger.audit('permission.approved', { approvalId, approver });
+
       permissionServer.resolveApproval(approvalId, true);
-      
+
       await respond({
         response_type: 'ephemeral',
         text: '✅ Tool execution approved'
@@ -920,10 +923,11 @@ export class SlackHandler {
     this.app.action('deny_tool', async ({ ack, body, respond }) => {
       await ack();
       const approvalId = (body as any).actions[0].value;
-      this.logger.info('Tool approval denied', { approvalId });
-      
+      const denier = (body as any).user?.id || 'unknown';
+      this.logger.audit('permission.denied', { approvalId, denier });
+
       permissionServer.resolveApproval(approvalId, false);
-      
+
       await respond({
         response_type: 'ephemeral',
         text: '❌ Tool execution denied'
