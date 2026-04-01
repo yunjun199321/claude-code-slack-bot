@@ -9,6 +9,8 @@ node_modules/
 
 mcp-servers.json
 bot-config.json
+prompts/system-prompt.md
+data/
 
 # Build output
 dist/
