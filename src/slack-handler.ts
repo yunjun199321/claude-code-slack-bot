@@ -43,6 +43,7 @@ export class SlackHandler {
   private botUserId: string | null = null;
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
   private rateLimiter: RateLimiter;
+  private tmuxSession: string | null = null;
 
   constructor(app: App, claudeHandler: ClaudeHandler, mcpManager: McpManager) {
     this.app = app;
@@ -51,6 +52,7 @@ export class SlackHandler {
     this.workingDirManager = new WorkingDirectoryManager();
     this.fileHandler = new FileHandler();
     this.todoManager = new TodoManager();
+    this.tmuxSession = this.detectTmuxSession();
     const rateLimit = parseInt(process.env.RATE_LIMIT_PER_MINUTE || '10', 10);
     this.rateLimiter = new RateLimiter(rateLimit, 60 * 1000);
   }
@@ -132,21 +134,28 @@ export class SlackHandler {
 
     const trimmed = text.trim().toLowerCase();
 
-    // !new
+    // !new — reset Claude session
     if (trimmed === '/new' || trimmed === '!new') {
       const key = this.claudeHandler.getSessionKey(user, channel, sessionThreadTs);
       this.logger.audit('session.reset', { user, channel, sessionKey: key });
       this.claudeHandler.deleteSession(user, channel, sessionThreadTs);
-      await say({ text: `🔄 *Session reset.* Ready for new conversation.`, ...replyOpts });
+      const workingDir = this.workingDirManager.getWorkingDirectory(channel, thread_ts, isDM ? user : undefined);
+      let welcome = workingDir ? formatWelcomeMessage(workingDir) : `🔄 *Session reset.* Ready for new conversation.`;
+      if (this.tmuxSession) welcome += `\n_tmux: \`tmux attach -t ${this.tmuxSession}\`_`;
+      await say({ text: welcome, ...replyOpts });
       return { handled: true, returned: true };
     }
 
-    // !quit (admin only)
+    // !quit — shut down (no admin restriction when ADMIN_USERS not configured)
     if (trimmed === '/quit' || trimmed === '!quit') {
-      if (!isAdmin) { await say({ text: '⛔ Admin only.', ...replyOpts }); return { handled: true, returned: true }; }
+      if (config.adminUsers.length > 0 && !isAdmin) {
+        await say({ text: '⛔ Admin only.', ...replyOpts });
+        return { handled: true, returned: true };
+      }
       this.logger.audit('command.quit', { user, channel });
       await say({ text: `👋 *Shutting down...*`, ...replyOpts });
-      try { require('child_process').execSync('tmux kill-session', { stdio: 'ignore' }); } catch { process.exit(0); }
+      const sessionArg = this.tmuxSession ? `-t ${this.tmuxSession}` : '';
+      try { require('child_process').execSync(`tmux kill-session ${sessionArg}`, { stdio: 'ignore' }); } catch { process.exit(0); }
       return { handled: true, returned: true };
     }
 
@@ -273,7 +282,9 @@ export class SlackHandler {
     }
 
     if (isNewSession) {
-      await say({ text: formatWelcomeMessage(workingDirectory), ...replyOpts });
+      let welcome = formatWelcomeMessage(workingDirectory);
+      if (this.tmuxSession) welcome += `\n_tmux: \`tmux attach -t ${this.tmuxSession}\`_`;
+      await say({ text: welcome, ...replyOpts });
     }
 
     let currentMessages: string[] = [];
@@ -618,6 +629,15 @@ export class SlackHandler {
     }
 
     await this.updateMessageReaction(sessionKey, emoji);
+  }
+
+  private detectTmuxSession(): string | null {
+    if (!process.env.TMUX) return null;
+    try {
+      return require('child_process').execSync('tmux display-message -p "#S"', { encoding: 'utf-8' }).trim();
+    } catch {
+      return null;
+    }
   }
 
   private isMcpInfoCommand(text: string): boolean {

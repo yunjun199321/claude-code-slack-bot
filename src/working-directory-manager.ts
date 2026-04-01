@@ -8,10 +8,49 @@ export class WorkingDirectoryManager {
   private configs: Map<string, WorkingDirectoryConfig> = new Map();
   private logger = new Logger('WorkingDirectoryManager');
   private cleanupTimer: ReturnType<typeof setInterval>;
+  private persistPath: string;
 
   constructor() {
+    this.persistPath = process.env.WORKING_DIR_PERSIST_PATH
+      || path.join(process.cwd(), 'data', 'working-dirs.json');
+    this.loadFromDisk();
     // Clean up stale entries every 10 minutes
     this.cleanupTimer = setInterval(() => this.cleanupStaleConfigs(), 10 * 60 * 1000);
+  }
+
+  private loadFromDisk(): void {
+    try {
+      if (!fs.existsSync(this.persistPath)) return;
+      const raw = JSON.parse(fs.readFileSync(this.persistPath, 'utf-8'));
+      let loaded = 0;
+      for (const [key, c] of Object.entries(raw) as [string, any][]) {
+        if (!fs.existsSync(c.directory)) continue; // skip if dir no longer exists
+        this.configs.set(key, {
+          channelId: c.channelId,
+          threadTs: c.threadTs,
+          userId: c.userId,
+          directory: c.directory,
+          setAt: new Date(c.setAt),
+          lastAccessed: new Date(c.lastAccessed),
+        });
+        loaded++;
+      }
+      this.logger.info('Working directory configs restored', { path: this.persistPath, count: loaded });
+    } catch (error) {
+      this.logger.warn('Failed to load working directory configs from disk', error);
+    }
+  }
+
+  private saveToDisk(): void {
+    try {
+      const dir = path.dirname(this.persistPath);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      const data: Record<string, WorkingDirectoryConfig> = {};
+      for (const [key, cfg] of this.configs.entries()) data[key] = cfg;
+      fs.writeFileSync(this.persistPath, JSON.stringify(data, null, 2), 'utf-8');
+    } catch (error) {
+      this.logger.warn('Failed to save working directory configs to disk', error);
+    }
   }
 
   /**
@@ -29,6 +68,7 @@ export class WorkingDirectoryManager {
       }
     }
     if (cleaned > 0) {
+      this.saveToDisk();
       this.logger.info(`Cleaned up ${cleaned} stale working directory configs (remaining: ${this.configs.size})`);
     }
   }
@@ -77,6 +117,7 @@ export class WorkingDirectoryManager {
       };
 
       this.configs.set(key, workingDirConfig);
+      this.saveToDisk();
       this.logger.info('Working directory set', {
         key,
         directory: resolvedPath,
@@ -169,6 +210,7 @@ export class WorkingDirectoryManager {
     const key = this.getConfigKey(channelId, threadTs, userId);
     const result = this.configs.delete(key);
     if (result) {
+      this.saveToDisk();
       this.logger.info('Working directory removed', { key });
     }
     return result;
